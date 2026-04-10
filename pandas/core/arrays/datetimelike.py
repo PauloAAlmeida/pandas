@@ -5,6 +5,7 @@ from datetime import (
     timedelta,
 )
 from functools import wraps
+from itertools import pairwise
 import operator
 from typing import (
     TYPE_CHECKING,
@@ -22,7 +23,7 @@ import warnings
 import numpy as np
 
 from pandas._config import using_string_dtype
-from pandas._config.config import get_option
+from pandas._config.config import _global_config as config
 
 from pandas._libs import (
     algos,
@@ -54,6 +55,7 @@ from pandas._libs.tslibs.fields import (
     round_nsint64,
 )
 from pandas._libs.tslibs.np_datetime import compare_mismatched_resolutions
+from pandas._libs.tslibs.offsets import FY5253Mixin
 from pandas._libs.tslibs.timedeltas import get_unit_for_round
 from pandas._libs.tslibs.timestamps import integer_op_not_supported
 from pandas._typing import (
@@ -78,6 +80,7 @@ from pandas.compat.numpy import function as nv
 from pandas.errors import (
     AbstractMethodError,
     InvalidComparison,
+    Pandas4Warning,
     PerformanceWarning,
 )
 from pandas.util._decorators import (
@@ -194,7 +197,7 @@ def _period_dispatch(meth: F) -> F:
         res_i8 = result.view("i8")
         return self._from_backing_data(res_i8)
 
-    return cast(F, new_meth)
+    return cast("F", new_meth)
 
 
 class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
@@ -208,8 +211,6 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
         freq
     """
 
-    # _infer_matches -> which infer_dtype strings are close enough to our own
-    _infer_matches: tuple[str, ...]
     _is_recognized_dtype: Callable[[DtypeObj], bool]
     _recognized_scalars: tuple[type, ...]
     _ndarray: np.ndarray
@@ -390,12 +391,12 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
         # Use cast as we know we will get back a DatetimeLikeArray or DTScalar,
         # but skip evaluating the Union at runtime for performance
         # (see https://github.com/pandas-dev/pandas/pull/44624)
-        result = cast(Union[Self, DTScalarOrNaT], super().__getitem__(key))
+        result = cast("Union[Self, DTScalarOrNaT]", super().__getitem__(key))
         if lib.is_scalar(result):
             return result
         else:
             # At this point we know the result is an array.
-            result = cast(Self, result)
+            result = cast("Self", result)
         # error: Incompatible types in assignment (expression has type
         # "BaseOffset | None", variable has type "None")
         result._freq = self._get_getitem_freq(key)  # type: ignore[assignment]
@@ -682,14 +683,34 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
         if hasattr(value, "dtype") and value.dtype == object:
             # `array` below won't do inference if value is an Index or Series.
             #  so do so here.  in the Index case, inferred_type may be cached.
-            if lib.infer_dtype(value) in self._infer_matches:
-                try:
-                    value = type(self)._from_sequence(value)
-                except (ValueError, TypeError) as err:
-                    if allow_object:
-                        return value
-                    msg = self._validation_error_message(value, True)
-                    raise TypeError(msg) from err
+            arr = np.asarray(value)
+            flat = arr.ravel() if arr.ndim != 1 else arr
+            converted = lib.maybe_convert_objects(
+                flat, convert_non_numeric=True, dtype_if_all_nat=self.dtype
+            )
+            converted = ensure_wrapped_if_datetimelike(converted)
+            if isinstance(converted, type(self)):
+                if (
+                    self.dtype.kind in "mM"
+                    and not allow_object
+                    and self.unit != converted.unit  # type: ignore[attr-defined]
+                ):
+                    converted = converted.as_unit(self.unit, round_ok=False)  # type: ignore[attr-defined]
+                if arr.ndim != 1:
+                    converted = converted.reshape(arr.shape)
+                return converted
+            elif self.dtype.kind == "M" and lib.infer_dtype(value) == "date":
+                # GH#65056
+                warnings.warn(
+                    "Inferring datetime64 from data containing datetime.date "
+                    "objects is deprecated. In a future version, these will "
+                    "be left as object dtype. Use "
+                    "pd.to_datetime to explicitly convert "
+                    "to datetime64.",
+                    Pandas4Warning,
+                    stacklevel=find_stack_level(),
+                )
+                value = type(self)._from_sequence(value)
 
         if isinstance(value, list):
             value = construct_1d_object_array_from_listlike(value)
@@ -755,6 +776,33 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
             other = other._ndarray
         return other
 
+    def fillna(self, value, limit: int | None = None, copy: bool = True) -> Self:
+        # Fast path: single-pass Cython using iNaT sentinel. GH#42147
+        if lib.is_scalar(value):
+            if not self._hasna:
+                return self.copy() if copy else self[:]
+            try:
+                validated = self._validate_setitem_value(value)
+            except (ValueError, TypeError):
+                pass
+            else:
+                if copy:
+                    new_ndarray = self._ndarray.copy()
+                else:
+                    if self._readonly:
+                        raise ValueError("Cannot modify read-only array")
+                    new_ndarray = self._ndarray
+
+                arr_i8 = new_ndarray.view("i8")
+                fill_i8 = np.array(validated, dtype=new_ndarray.dtype).view("i8")[()]
+                algos.scalar_fillna_inplace(
+                    arr_i8, fill_i8, is_datetimelike=True, limit=limit
+                )
+
+                return type(self)._simple_new(new_ndarray, dtype=self.dtype)
+
+        return super().fillna(value, limit=limit, copy=copy)
+
     # ------------------------------------------------------------------
     # Additional array methods
     #  These are not part of the EA API, but we implement them because
@@ -808,8 +856,9 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
 
         if self.dtype.kind in "mM":
             self = cast("DatetimeArray | TimedeltaArray", self)
-            # error: "DatetimeLikeArrayMixin" has no attribute "as_unit"
-            values = values.as_unit(self.unit)  # type: ignore[attr-defined]
+            # Cast to the higher resolution to avoid silently truncating
+            #  finer-resolution values, which could lead to false matches.
+            self, values = self._ensure_matching_resos(values)
 
         try:
             # error: Argument 1 to "_check_compatible_with" of "DatetimeLikeArrayMixin"
@@ -987,6 +1036,19 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
             # TODO: handle 2D-like listlikes
             return op(self.ravel(), other.ravel()).reshape(self.shape)
 
+        if is_list_like(other):
+            if not isinstance(
+                other, (list, np.ndarray, ExtensionArray)
+            ) and not ops.has_castable_attr(other):
+                warnings.warn(
+                    f"Operation with {type(other).__name__} is deprecated. "
+                    "In a future version these will be treated as scalar-like. "
+                    "To retain the old behavior, explicitly wrap in a Series "
+                    "instead.",
+                    Pandas4Warning,
+                    stacklevel=find_stack_level(),
+                )
+
         try:
             other = self._validate_comparison_value(other)
         except InvalidComparison:
@@ -1010,7 +1072,7 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
             return result
 
         if not isinstance(self.dtype, PeriodDtype):
-            self = cast(TimelikeOps, self)
+            self = cast("TimelikeOps", self)
             if self._creso != other._creso:
                 if not isinstance(other, type(self)):
                     # i.e. Timedelta/Timestamp, cast to ndarray and let
@@ -1370,7 +1432,7 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
             # If both 1D then broadcasting is unambiguous
             return op(self, other[0])
 
-        if get_option("performance_warnings"):
+        if config["mode"]["performance_warnings"]:
             warnings.warn(
                 "Adding/subtracting object-dtype array to "
                 f"{type(self).__name__} not vectorized.",
@@ -1698,7 +1760,7 @@ class DatetimeLikeArrayMixin(OpsMixin, NDArrayBackedExtensionArray):
 
         i8modes, _ = algorithms.mode(self.view("i8"), mask=mask)
         npmodes = i8modes.view(self._ndarray.dtype)
-        npmodes = cast(np.ndarray, npmodes)
+        npmodes = cast("np.ndarray", npmodes)
         return self._from_backing_data(npmodes)
 
     # ------------------------------------------------------------------
@@ -1920,7 +1982,33 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             # Otherwise we just need to check that the user-passed freq
             #  doesn't conflict with the one we already have.
             freq = to_offset(freq)
-            _validate_inferred_freq(freq, self._freq)
+            if freq != self._freq:
+                # GH#61086 freq may be equivalent but not equal (e.g.
+                # QS-FEB vs QS-MAY), so validate against the actual data.
+                if len(self) == 0:
+                    pass
+                elif len(self) == 1:
+                    if not freq.is_on_offset(self[0]):
+                        raise ValueError(
+                            f"Inferred frequency {self._freq} from passed "
+                            "values does not conform to passed frequency "
+                            f"{freq.freqstr}"
+                        )
+                elif self[0] + freq == self[1]:
+                    # For standard offsets, the step is a deterministic
+                    # function of the date, so agreement on one step proves
+                    # equivalence. For Custom/FY5253 offsets, external
+                    # state (holidays, 52/53-week patterns) could cause
+                    # later steps to diverge, so we validate fully.
+                    if hasattr(freq, "_holidays") or isinstance(freq, FY5253Mixin):
+                        type(self)._validate_frequency(self, freq, **validate_kwds)
+                else:
+                    raise ValueError(
+                        f"Inferred frequency {self._freq} from passed "
+                        "values does not conform to passed frequency "
+                        f"{freq.freqstr}"
+                    )
+            self._freq = freq
 
     @final
     @classmethod
@@ -2105,7 +2193,7 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             )
 
         values = self.view("i8")
-        values = cast(np.ndarray, values)
+        values = cast("np.ndarray", values)
         nanos = get_unit_for_round(freq, self._creso)
         if nanos == 0:
             # GH 52761
@@ -2124,6 +2212,10 @@ class TimelikeOps(DatetimeLikeArrayMixin):
         """
         Perform round operation on the data to the specified `freq`.
 
+        This method rounds each datetime value in the Series/Index to the
+        nearest specified frequency using standard rounding rules (round half
+        to even).
+
         Parameters
         ----------
         freq : str or Offset
@@ -2135,7 +2227,7 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             Only relevant for DatetimeIndex:
 
             - 'infer' will attempt to infer fall dst-transition hours based on
-              order
+              order. Requires that the timestamps are monotonically increasing.
             - bool-ndarray where True signifies a DST time, False designates
               a non-DST time (note that this flag is only applicable for
               ambiguous times)
@@ -2228,6 +2320,9 @@ class TimelikeOps(DatetimeLikeArrayMixin):
         """
         Perform floor operation on the data to the specified `freq`.
 
+        This method rounds each datetime value in the Series/Index down to
+        the specified frequency (i.e., towards negative infinity).
+
         Parameters
         ----------
         freq : str or Offset
@@ -2239,7 +2334,7 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             Only relevant for DatetimeIndex:
 
             - 'infer' will attempt to infer fall dst-transition hours based on
-              order
+              order. Requires that the timestamps are monotonically increasing.
             - bool-ndarray where True signifies a DST time, False designates
               a non-DST time (note that this flag is only applicable for
               ambiguous times)
@@ -2332,6 +2427,9 @@ class TimelikeOps(DatetimeLikeArrayMixin):
         """
         Perform ceil operation on the data to the specified `freq`.
 
+        This method rounds each datetime value in the Series/Index up to
+        the specified frequency (i.e., towards positive infinity).
+
         Parameters
         ----------
         freq : str or Offset
@@ -2343,7 +2441,7 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             Only relevant for DatetimeIndex:
 
             - 'infer' will attempt to infer fall dst-transition hours based on
-              order
+              order. Requires that the timestamps are monotonically increasing.
             - bool-ndarray where True signifies a DST time, False designates
               a non-DST time (note that this flag is only applicable for
               ambiguous times)
@@ -2524,7 +2622,7 @@ class TimelikeOps(DatetimeLikeArrayMixin):
             to_concat = [x for x in to_concat if len(x)]
 
             if obj.freq is not None and all(x.freq == obj.freq for x in to_concat):
-                pairs = zip(to_concat[:-1], to_concat[1:], strict=True)
+                pairs = pairwise(to_concat)
                 if all(pair[0][-1] + obj.freq == pair[1][0] for pair in pairs):
                     new_freq = obj.freq
                     new_obj._freq = new_freq

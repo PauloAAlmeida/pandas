@@ -42,6 +42,8 @@ from pandas.core.arrays import (
 ok_for_period = PeriodArray._datetimelike_ops
 ok_for_period_methods = ["strftime", "to_timestamp", "asfreq"]
 ok_for_dt = DatetimeArray._datetimelike_ops
+# GH#46768 - deprecated aliases that should be skipped in property access tests
+_deprecated_dt_attrs = {"dayofweek", "dayofyear", "daysinmonth", "weekday"}
 ok_for_dt_methods = [
     "to_period",
     "to_pydatetime",
@@ -108,9 +110,10 @@ class TestSeriesDatetimeValues:
         ser = Series(dti, name="xxx")
 
         for prop in ok_for_dt:
-            # we test freq below
-            if prop != "freq":
-                self._compare(ser, prop)
+            # we test freq below; GH#46768 skip deprecated aliases
+            if prop == "freq" or prop in _deprecated_dt_attrs:
+                continue
+            self._compare(ser, prop)
 
         for prop in ok_for_dt_methods:
             getattr(ser.dt, prop)
@@ -145,9 +148,10 @@ class TestSeriesDatetimeValues:
         dti = date_range("20130101", periods=5, tz="US/Eastern")
         ser = Series(dti, name="xxx")
         for prop in ok_for_dt:
-            # we test freq below
-            if prop != "freq":
-                self._compare(ser, prop)
+            # we test freq below; GH#46768 skip deprecated aliases
+            if prop == "freq" or prop in _deprecated_dt_attrs:
+                continue
+            self._compare(ser, prop)
 
         for prop in ok_for_dt_methods:
             getattr(ser.dt, prop)
@@ -215,9 +219,10 @@ class TestSeriesDatetimeValues:
         ser = Series(pi, name="xxx")
 
         for prop in ok_for_period:
-            # we test freq below
-            if prop != "freq":
-                self._compare(ser, prop)
+            # we test freq below; GH#46768 skip deprecated aliases
+            if prop == "freq" or prop in _deprecated_dt_attrs:
+                continue
+            self._compare(ser, prop)
 
         for prop in ok_for_period_methods:
             getattr(ser.dt, prop)
@@ -485,7 +490,9 @@ class TestSeriesDatetimeValues:
             "Saturday",
             "Sunday",
         ]
-        for day, name, eng_name in zip(range(4, 11), expected_days, english_days):
+        for day, name, eng_name in zip(
+            range(4, 11), expected_days, english_days, strict=True
+        ):
             name = name.capitalize()
             assert ser.dt.day_name(locale=time_locale)[day] == name
             assert ser.dt.day_name(locale=None)[day] == eng_name
@@ -502,7 +509,7 @@ class TestSeriesDatetimeValues:
 
         tm.assert_series_equal(result, expected)
 
-        for s_date, expected in zip(ser, expected_months):
+        for s_date, expected in zip(ser, expected_months, strict=True):
             result = s_date.month_name(locale=time_locale)
             expected = expected.capitalize()
 

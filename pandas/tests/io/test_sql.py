@@ -191,7 +191,7 @@ def create_and_load_iris(conn, iris_file: Path):
     with iris_file.open(newline=None, encoding="utf-8") as csvfile:
         reader = csv.reader(csvfile)
         header = next(reader)
-        params = [dict(zip(header, row)) for row in reader]
+        params = [dict(zip(header, row, strict=True)) for row in reader]
         stmt = insert(iris).values(params)
         with conn.begin() as con:
             iris.drop(con, checkfirst=True)
@@ -1210,7 +1210,7 @@ def test_to_sql_callable(conn, test_frame1, request):
 
     def sample(pd_table, conn, keys, data_iter):
         check.append(1)
-        data = [dict(zip(keys, row)) for row in data_iter]
+        data = [dict(zip(keys, row, strict=True)) for row in data_iter]
         conn.execute(pd_table.table.insert(), data)
 
     with pandasSQL_builder(conn, need_transaction=True) as pandasSQL:
@@ -1338,7 +1338,7 @@ def test_insertion_method_on_conflict_do_nothing(conn, request):
     from sqlalchemy.sql import text
 
     def insert_on_conflict(table, conn, keys, data_iter):
-        data = [dict(zip(keys, row)) for row in data_iter]
+        data = [dict(zip(keys, row, strict=True)) for row in data_iter]
         stmt = (
             insert(table.table)
             .values(data)
@@ -1420,7 +1420,7 @@ def test_insertion_method_on_conflict_update(conn, request):
     from sqlalchemy.sql import text
 
     def insert_on_conflict(table, conn, keys, data_iter):
-        data = [dict(zip(keys, row)) for row in data_iter]
+        data = [dict(zip(keys, row, strict=True)) for row in data_iter]
         stmt = insert(table.table).values(data)
         stmt = stmt.on_duplicate_key_update(b=stmt.inserted.b, c=stmt.inserted.c)
         result = conn.execute(stmt)
@@ -1978,9 +1978,7 @@ def test_api_to_sql_index_label_multiindex(conn, request):
     conn_name = conn
     if "mysql" in conn_name:
         request.applymarker(
-            pytest.mark.xfail(
-                reason="MySQL can fail using TEXT without length as key", strict=False
-            )
+            pytest.mark.xfail(reason="MySQL can fail using TEXT without length as key")
         )
     elif "adbc" in conn_name:
         request.node.add_marker(
@@ -3855,16 +3853,10 @@ def test_read_sql_string_inference(sqlite_engine):
     # GH#54430
     table = "test"
     df = DataFrame({"a": ["x", "y"]})
+    expected = df.copy()
+
     df.to_sql(table, con=conn, index=False, if_exists="replace")
-
-    with pd.option_context("future.infer_string", True):
-        result = read_sql_table(table, conn)
-
-    dtype = pd.StringDtype(na_value=np.nan)
-    expected = DataFrame(
-        {"a": ["x", "y"]}, dtype=dtype, columns=Index(["a"], dtype=dtype)
-    )
-
+    result = read_sql_table(table, conn)
     tm.assert_frame_equal(result, expected)
 
 

@@ -233,6 +233,25 @@ class TestDataFrameEval:
         expected = Series([1.5 + 0.5j])
         tm.assert_series_equal(result, expected)
 
+    def test_query_period_dtype(self, engine, parser):
+        # GH#35247
+        df = DataFrame(
+            {
+                "year": pd.period_range("2018", periods=5, freq="Y"),
+                "val": range(5),
+            }
+        )
+        result = df.query("year > '2020'", engine=engine, parser=parser)
+        expected = df[df["year"] > "2020"]
+        tm.assert_frame_equal(result, expected)
+
+    def test_query_interval_dtype(self, engine, parser):
+        # GH#35247
+        idx = pd.IntervalIndex.from_breaks(range(6))
+        df = DataFrame({"a": idx, "b": idx})
+        result = df.query("a == b", engine=engine, parser=parser)
+        tm.assert_frame_equal(result, df)
+
 
 class TestDataFrameQueryWithMultiIndex:
     def test_query_with_named_multiindex(self, parser, engine):
@@ -997,7 +1016,7 @@ class TestDataFrameQueryStrings:
             ops = 2 * ([eq, ne])
             msg = r"'(Not)?In' nodes are not implemented"
 
-            for lh, op_, rh in zip(lhs, ops, rhs):
+            for lh, op_, rh in zip(lhs, ops, rhs, strict=True):
                 ex = f"{lh} {op_} {rh}"
                 with pytest.raises(NotImplementedError, match=msg):
                     df.query(
@@ -1038,7 +1057,7 @@ class TestDataFrameQueryStrings:
             ops = 2 * ([eq, ne])
             msg = r"'(Not)?In' nodes are not implemented"
 
-            for lh, ops_, rh in zip(lhs, ops, rhs):
+            for lh, ops_, rh in zip(lhs, ops, rhs, strict=True):
                 ex = f"{lh} {ops_} {rh}"
                 with pytest.raises(NotImplementedError, match=msg):
                     df.query(ex, engine=engine, parser=parser)

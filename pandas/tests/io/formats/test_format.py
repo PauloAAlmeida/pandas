@@ -109,7 +109,7 @@ class TestDataFrameFormatting:
 
             adj = printing.get_adjustment()
 
-            for line, value in zip(r.split("\n"), df["B"]):
+            for line, value in zip(r.split("\n"), df["B"], strict=True):
                 if adj.len(value) + 1 > max_len:
                     assert "..." in line
                 else:
@@ -284,6 +284,31 @@ class TestDataFrameFormatting:
             "pandas.io.formats.format.get_terminal_size", lambda: terminal_size
         )
         assert "..." not in str(df)
+
+    def test_repr_truncation_accounts_for_dot_separator(self, monkeypatch):
+        # GH#32461 - repr should not exceed terminal width after inserting
+        # the " ..." separator column during horizontal truncation.
+        # Width 82 hits the boundary where the unfixed code overflows by 4
+        # because the " ..." separator column (4 chars + 1 adjoin spacing)
+        # was not budgeted.
+        terminal_width = 82
+        monkeypatch.setattr(
+            "pandas.io.formats.string.get_terminal_size",
+            lambda: (terminal_width, 24),
+        )
+
+        ncols = 20
+        df = DataFrame(
+            {
+                f"col_{idx:02d}": np.random.default_rng(2).standard_normal(3)
+                for idx in range(ncols)
+            }
+        )
+
+        with option_context("display.width", terminal_width, "display.max_columns", 0):
+            result = repr(df)
+            for line in result.split("\n"):
+                assert len(line) <= terminal_width
 
     def test_repr_truncation_column_size(self):
         # dataframe with last column very wide -> check it is not used to
@@ -1742,7 +1767,7 @@ class TestSeriesFormatting:
             ["bar", "bar", "baz", "baz", "foo", "foo", "qux", "qux"],
             ["one", "two", "one", "two", "one", "two", "one", "two"],
         ]
-        tuples = list(zip(*arrays))
+        tuples = list(zip(*arrays, strict=True))
         index = MultiIndex.from_tuples(tuples, names=["first", "second"])
         s = Series(np.random.default_rng(2).standard_normal(8), index=index)
 
@@ -1921,6 +1946,16 @@ class TestGenericArrayFormatter:
         assert len(res) == 2
         assert res[0] == " [[True, True], [False, False]]"
         assert res[1] == " [[False, True], [True, False]]"
+
+
+def test_precision_float_in_object_index():
+    # GH#25919 - display.precision not honored for float values in object index
+    float_val = 0.55555555
+    df = DataFrame([float_val, "foo"], index=[float_val, "foo"])
+    with option_context("display.precision", 3):
+        result = repr(df)
+    assert "0.556" in result
+    assert "0.55555555" not in result
 
 
 def _three_digit_exp():
